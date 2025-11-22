@@ -16,7 +16,10 @@ class CoinRankItem(BaseModel):
 
 class TopUptrendItem(BaseModel):
     coin_id: str
-    percent_change_24h: Optional[float]
+    name: str
+    symbol: str
+    price: float
+    percent_change: float
 
 class MarketGrowthItem(BaseModel):
     change_pct_market_1d: Optional[float]
@@ -68,4 +71,5 @@ class NewsItem(BaseModel):
     url: str
     source_id: Optional[str]
     sentiment: Optional[str]
-    score: Optional[float]
+    score: Optional[float] = 0.0
+    keywords: Optional[str] = None

@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS portfolio (
 
 -- Adjust coin_id values to match your dataset
 INSERT INTO portfolio (user_id, coin_id, quantity, avg_cost) VALUES
-(1, 'bitcoin', 0.75, 35000),
+(1, 'bitcoin', 0.15, 35000),
 (1, 'ethereum', 8.0, 1800),
 (1, 'tether', 1000, 1),
 (1, 'ripple', 1500, 0.45),

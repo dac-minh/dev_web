@@ -58,11 +58,108 @@ WHERE rank <= 100
 ORDER BY rank ASC;
 """
 
-Q_TOP_5_COINS_UP_TRENDING_1D = """
-WITH latest_date AS (SELECT MAX(date_id) AS max_date_id FROM fact_coin_metrics)
-SELECT m.coin_id, m.percent_change_24h
-FROM fact_coin_metrics m JOIN latest_date ld ON m.date_id = ld.max_date_id
-WHERE m.percent_change_24h IS NOT NULL ORDER BY m.percent_change_24h DESC LIMIT 5;
+# queries.py
+
+# ... (giữ nguyên các query khác ở trên) ...
+
+# ====================================================
+# FIX LỖI TRÙNG LẶP CHO TOP UPTREND
+# ====================================================
+
+# 1. Top 5 Uptrend 1 Ngày (Đã fix duplicate)
+Q_TOP_5_UPTREND_1D = """
+WITH latest_date AS (
+    SELECT MAX(date_id) AS max_date_id FROM fact_coin_metrics
+),
+unique_daily_metrics AS (
+    SELECT 
+        m.coin_id,
+        m.price_usd,
+        m.percent_change_24h,
+        -- Xếp hạng các dòng của cùng 1 coin theo thời gian cập nhật mới nhất (api_timestamp)
+        ROW_NUMBER() OVER(PARTITION BY m.coin_id ORDER BY m.api_timestamp DESC) as rn
+    FROM fact_coin_metrics m 
+    JOIN latest_date ld ON m.date_id = ld.max_date_id
+    WHERE m.percent_change_24h IS NOT NULL
+)
+SELECT 
+    u.coin_id,
+    COALESCE(dc.description, u.coin_id) AS name,
+    COALESCE(dc.currency_code, UPPER(SUBSTRING(u.coin_id FROM 1 FOR 3))) AS symbol,
+    u.price_usd AS price,
+    u.percent_change_24h AS percent_change
+FROM unique_daily_metrics u
+LEFT JOIN dim_coin_mapping map ON u.coin_id = map.coin_id
+LEFT JOIN dim_currencies dc ON map.currency_id = dc.currency_id
+WHERE u.rn = 1 -- Chỉ lấy dòng mới nhất của mỗi coin
+ORDER BY u.percent_change_24h DESC 
+LIMIT 5;
+"""
+
+# 2. Top 5 Uptrend 1 Tuần (Đã fix duplicate)
+Q_TOP_5_UPTREND_7D = """
+WITH latest_date AS (
+    SELECT MAX(date_id) AS max_date_id FROM fact_coin_metrics
+),
+unique_weekly_metrics AS (
+    SELECT 
+        m.coin_id,
+        m.price_usd,
+        m.percent_change_7d,
+        ROW_NUMBER() OVER(PARTITION BY m.coin_id ORDER BY m.api_timestamp DESC) as rn
+    FROM fact_coin_metrics m 
+    JOIN latest_date ld ON m.date_id = ld.max_date_id
+    WHERE m.percent_change_7d IS NOT NULL
+)
+SELECT 
+    u.coin_id,
+    COALESCE(dc.description, u.coin_id) AS name,
+    COALESCE(dc.currency_code, UPPER(SUBSTRING(u.coin_id FROM 1 FOR 3))) AS symbol,
+    u.price_usd AS price,
+    u.percent_change_7d AS percent_change
+FROM unique_weekly_metrics u
+LEFT JOIN dim_coin_mapping map ON u.coin_id = map.coin_id
+LEFT JOIN dim_currencies dc ON map.currency_id = dc.currency_id
+WHERE u.rn = 1
+ORDER BY u.percent_change_7d DESC 
+LIMIT 5;
+"""
+
+# 3. Top 5 Uptrend 30 Ngày (Đã fix duplicate & Logic tính toán)
+Q_TOP_5_UPTREND_30D = """
+WITH latest_date AS (
+    SELECT MAX(date_id) AS max_date_id FROM fact_coin_metrics
+),
+-- Lấy giá hiện tại duy nhất cho mỗi coin
+price_current AS (
+    SELECT 
+        m.coin_id, m.price_usd,
+        ROW_NUMBER() OVER(PARTITION BY m.coin_id ORDER BY m.api_timestamp DESC) as rn
+    FROM fact_coin_metrics m
+    JOIN latest_date ld ON m.date_id = ld.max_date_id
+),
+-- Lấy giá 30 ngày trước duy nhất cho mỗi coin
+price_30d_ago AS (
+    SELECT 
+        m.coin_id, m.price_usd,
+        ROW_NUMBER() OVER(PARTITION BY m.coin_id ORDER BY m.api_timestamp DESC) as rn
+    FROM fact_coin_metrics m 
+    JOIN latest_date ld ON m.date_id = (ld.max_date_id - 30) -- Giả định date_id là liên tục
+)
+SELECT 
+    curr.coin_id,
+    COALESCE(dc.description, curr.coin_id) AS name,
+    COALESCE(dc.currency_code, UPPER(SUBSTRING(curr.coin_id FROM 1 FOR 3))) AS symbol,
+    curr.price_usd AS price,
+    CAST(ROUND(CAST(((curr.price_usd - prev.price_usd) / NULLIF(prev.price_usd, 0)) * 100.0 AS numeric), 2) AS double precision) AS percent_change
+FROM price_current curr
+JOIN price_30d_ago prev ON curr.coin_id = prev.coin_id
+LEFT JOIN dim_coin_mapping map ON curr.coin_id = map.coin_id
+LEFT JOIN dim_currencies dc ON map.currency_id = dc.currency_id
+WHERE curr.rn = 1 AND prev.rn = 1 -- Chỉ lấy bản ghi đại diện duy nhất
+  AND prev.price_usd > 0
+ORDER BY percent_change DESC
+LIMIT 5;
 """
 
 Q_MARKET_CHANGE_1D = """
@@ -73,7 +170,9 @@ ORDER BY d.full_date DESC LIMIT 1;
 
 Q_VOLUME_24H = """
 WITH volume_by_day AS (
-    SELECT d.full_date, SUM(mv.value) FILTER (WHERE LOWER(mv.currency_id) = 'usd') AS total_volume_usd,
+    SELECT d.full_date, 
+           -- SỬA LỖI: Đổi mv.value thành mv.volume
+           SUM(mv.volume) FILTER (WHERE LOWER(mv.currency_id) = 'usd') AS total_volume_usd,
            ROW_NUMBER() OVER (ORDER BY d.full_date DESC) AS rn
     FROM fact_market_volume mv
     JOIN fact_market_global g ON g.market_id = mv.market_id
@@ -85,24 +184,45 @@ FROM volume_by_day cur LEFT JOIN volume_by_day prev ON prev.rn = 2 WHERE cur.rn 
 """
 
 Q_MARKET_SENTIMENT = """
-WITH latest_news_date AS (SELECT MAX(published_on::date) AS max_date FROM fact_news WHERE published_on IS NOT NULL)
+WITH latest_news_date AS (
+    -- Lấy ngày mới nhất có tin tức trong database
+    SELECT MAX(published_on::date) AS max_date 
+    FROM fact_news 
+    WHERE published_on IS NOT NULL
+),
+sentiment_values AS (
+    SELECT 
+        -- Chuyển đổi text sentiment thành điểm số
+        CASE 
+            WHEN UPPER(sentiment) = 'POSITIVE' THEN 1 
+            WHEN UPPER(sentiment) = 'NEGATIVE' THEN -1 
+            ELSE 0 
+        END AS calculated_score
+    FROM fact_news f
+    JOIN latest_news_date lnd ON f.published_on::date = lnd.max_date
+)
 SELECT
-    CAST(ROUND(AVG(f.score)::numeric, 4) AS double precision) AS average_sentiment_score,
-    CASE WHEN AVG(f.score) > 0.15 THEN 'Positive' WHEN AVG(f.score) < -0.15 THEN 'Neutral' ELSE 'Neutral' END AS market_sentiment_label
-FROM fact_news f JOIN latest_news_date lnd ON f.published_on::date = lnd.max_date
-WHERE f.score IS NOT NULL;
+    -- Tính trung bình cộng của các điểm số
+    CAST(ROUND(AVG(calculated_score)::numeric, 4) AS double precision) AS average_sentiment_score,
+    -- Gán nhãn dựa trên điểm trung bình
+    CASE 
+        WHEN AVG(calculated_score) >= 0.05 THEN 'Positive' 
+        WHEN AVG(calculated_score) <= -0.05 THEN 'Negative' 
+        ELSE 'Neutral' 
+    END AS market_sentiment_label
+FROM sentiment_values;
 """
 
-Q_COIN_SPARKLINES_7D = """
-WITH latest_date AS (SELECT MAX(date_id) AS max_date_id FROM fact_price_history),
-recent_prices AS (
-    SELECT f.coin_id, f.close, d.full_date
-    FROM fact_price_history f JOIN dim_dates d ON f.date_id = d.date_id
-    JOIN latest_date ld ON f.date_id >= (ld.max_date_id - 6) AND f.date_id <= ld.max_date_id
-)
-SELECT coin_id, ARRAY_AGG(close ORDER BY full_date ASC) AS sparkline_prices
-FROM recent_prices GROUP BY coin_id;
-"""
+# Q_COIN_SPARKLINES_7D = """
+# WITH latest_date AS (SELECT MAX(date_id) AS max_date_id FROM fact_price_history),
+# recent_prices AS (
+#     SELECT f.coin_id, f.close, d.full_date
+#     FROM fact_price_history f JOIN dim_dates d ON f.date_id = d.date_id
+#     JOIN latest_date ld ON f.date_id >= (ld.max_date_id - 6) AND f.date_id <= ld.max_date_id
+# )
+# SELECT coin_id, ARRAY_AGG(close ORDER BY full_date ASC) AS sparkline_prices
+# FROM recent_prices GROUP BY coin_id;
+# """
 
 Q_MARKET_CHANGE_7D = """
 WITH market_cap_by_day AS (
@@ -185,18 +305,19 @@ LIMIT 1;
 Q_COIN_HISTORY_DAILY = """
 SELECT 
     d.full_date AS date, 
-    COALESCE(f.close, f.open, 0) as close, 
-    COALESCE(f.volume, 0) as volume, 
-    COALESCE(f.open, f.close, 0) as open, 
-    COALESCE(f.high, f.close, f.open, 0) as high, 
-    COALESCE(f.low, f.close, f.open, 0) as low
+    COALESCE(f.open, 0) as open, 
+    COALESCE(f.high, 0) as high, 
+    COALESCE(f.low, 0) as low, 
+    COALESCE(f.close, 0) as close, 
+    COALESCE(f.volume, 0) as volume
 FROM fact_price_history f
 JOIN dim_dates d ON f.date_id = d.date_id
-WHERE f.coin_id = %(coin_id)s AND d.full_date >= %(start_date)s
+WHERE f.coin_id = %(coin_id)s 
+  AND d.full_date >= %(start_date)s
 ORDER BY d.full_date ASC;
 """
 
-# Lấy dữ liệu HÀNG TUẦN (cho 3M, 1Y)
+# Query cho biểu đồ tuần (Weekly)
 Q_COIN_HISTORY_WEEKLY = """
 WITH weekly_data AS (
     SELECT
@@ -207,21 +328,22 @@ WITH weekly_data AS (
         ROW_NUMBER() OVER(PARTITION BY date_trunc('week', d.full_date) ORDER BY d.full_date DESC) as rn_desc
     FROM fact_price_history f
     JOIN dim_dates d ON f.date_id = d.date_id
-    WHERE f.coin_id = %(coin_id)s AND d.full_date >= %(start_date)s
+    WHERE f.coin_id = %(coin_id)s 
+      AND d.full_date >= %(start_date)s
 )
 SELECT
     week_start AS date,
-    COALESCE(MAX(open) FILTER (WHERE rn_asc = 1), 0) as open,
-    COALESCE(MAX(high), 0) as high,
-    COALESCE(MIN(low), 0) as low,
-    COALESCE(MAX(close) FILTER (WHERE rn_desc = 1), 0) as close,
-    COALESCE(SUM(volume), 0) as volume
+    MAX(open) FILTER (WHERE rn_asc = 1) as open,
+    MAX(high) as high,
+    MIN(low) as low,
+    MAX(close) FILTER (WHERE rn_desc = 1) as close,
+    SUM(volume) as volume
 FROM weekly_data
 GROUP BY week_start
 ORDER BY week_start ASC;
 """
 
-# Lấy dữ liệu HÀNG THÁNG (cho ALL)
+# Query cho biểu đồ tháng (Monthly)
 Q_COIN_HISTORY_MONTHLY = """
 WITH monthly_data AS (
     SELECT
@@ -232,23 +354,71 @@ WITH monthly_data AS (
         ROW_NUMBER() OVER(PARTITION BY date_trunc('month', d.full_date) ORDER BY d.full_date DESC) as rn_desc
     FROM fact_price_history f
     JOIN dim_dates d ON f.date_id = d.date_id
-    WHERE f.coin_id = %(coin_id)s AND d.full_date >= %(start_date)s
+    WHERE f.coin_id = %(coin_id)s 
+      AND d.full_date >= %(start_date)s
 )
 SELECT
     month_start AS date,
-    COALESCE(MAX(open) FILTER (WHERE rn_asc = 1), 0) as open,
-    COALESCE(MAX(high), 0) as high,
-    COALESCE(MIN(low), 0) as low,
-    COALESCE(MAX(close) FILTER (WHERE rn_desc = 1), 0) as close,
-    COALESCE(SUM(volume), 0) as volume
+    MAX(open) FILTER (WHERE rn_asc = 1) as open,
+    MAX(high) as high,
+    MIN(low) as low,
+    MAX(close) FILTER (WHERE rn_desc = 1) as close,
+    SUM(volume) as volume
 FROM monthly_data
 GROUP BY month_start
 ORDER BY month_start ASC;
 """
 
+# Sparklines cho Dashboard (Top 100)
+Q_COIN_SPARKLINES_7D = """
+WITH latest_date AS (SELECT MAX(date_id) AS max_date_id FROM fact_price_history),
+recent_prices AS (
+    SELECT f.coin_id, f.close, d.full_date
+    FROM fact_price_history f 
+    JOIN dim_dates d ON f.date_id = d.date_id
+    JOIN latest_date ld ON f.date_id >= (ld.max_date_id - 6) AND f.date_id <= ld.max_date_id
+)
+SELECT coin_id, ARRAY_AGG(close ORDER BY full_date ASC) AS sparkline_prices
+FROM recent_prices 
+GROUP BY coin_id;
+"""
+
 Q_COIN_DETAIL_NEWS = """
-SELECT title, published_on, url, source_id, sentiment, score
+SELECT 
+    title, 
+    published_on, 
+    url, 
+    source_id, 
+    sentiment, 
+    score, 
+    keywords  -- <--- BỔ SUNG DÒNG NÀY
 FROM fact_news
 WHERE (LOWER(title) LIKE '%%' || LOWER(%(coin_id)s) || '%%' OR LOWER(keywords) LIKE '%%' || LOWER(%(coin_id)s) || '%%')
 ORDER BY published_on DESC LIMIT 10;
+"""
+
+Q_COIN_SPARKLINE = """
+SELECT 
+    d.full_date AS date, 
+    f.close AS price
+FROM fact_price_history f
+JOIN dim_dates d ON f.date_id = d.date_id
+WHERE f.coin_id = %(coin_id)s
+ORDER BY d.full_date DESC
+LIMIT 30; -- Lấy 30 điểm dữ liệu gần nhất
+"""
+
+Q_LATEST_MARKET_NEWS = """
+SELECT 
+    news_id,
+    title,
+    published_on,
+    url,
+    source_id,
+    sentiment,
+    score, -- <--- THÊM DÒNG NÀY
+    keywords
+FROM fact_news
+ORDER BY published_on DESC
+LIMIT 20;
 """

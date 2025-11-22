@@ -10,6 +10,8 @@ from models import (
     MarketCapGrowthCalculatedItem
 )
 import uvicorn
+from pydantic import BaseModel
+from datetime import date
 
 app = FastAPI(title="Crypto Market Data API")
 app.add_middleware(
@@ -27,7 +29,13 @@ def get_top100_coins(): return fetch_all(Q.Q_TOP_100_COINS_BY_MARKETCAP)
 def get_all_sparklines(): return fetch_all(Q.Q_COIN_SPARKLINES_7D)
 
 @app.get("/api/market/uptrend", response_model=List[TopUptrendItem], tags=["Dashboard"])
-def get_top_uptrend(): return fetch_all(Q.Q_TOP_5_COINS_UP_TRENDING_1D)
+def get_top_uptrend(type: str = Query("1D", description="Time range: 1D, 1W, 1M")):
+    if type == "1W":
+        return fetch_all(Q.Q_TOP_5_UPTREND_7D)
+    elif type == "1M":
+        return fetch_all(Q.Q_TOP_5_UPTREND_30D)
+    else:
+        return fetch_all(Q.Q_TOP_5_UPTREND_1D)
 
 @app.get("/api/market/cap_growth", response_model=MarketGrowthItem, tags=["Dashboard"])
 def get_market_cap_growth():
@@ -80,6 +88,23 @@ def get_coin_history(
 @app.get("/api/coins/{coin_id}/news", response_model=List[NewsItem], tags=["Coin Detail"])
 def get_coin_news(coin_id: str):
     return fetch_all(Q.Q_COIN_DETAIL_NEWS, {"coin_id": coin_id})
+
+class SparklineResponse(BaseModel):
+    date: date
+    price: float
+
+@app.get("/api/coins/{coin_id}/sparkline", response_model=List[SparklineResponse], tags=["Coin Detail"])
+def get_coin_sparkline(coin_id: str):
+    # Gọi query lấy dữ liệu sparkline
+    data = fetch_all(Q.Q_COIN_SPARKLINE, {"coin_id": coin_id})
+    if not data:
+        return []
+    # Đảo ngược lại để hiển thị từ cũ đến mới trên biểu đồ
+    return data[::-1]
+
+@app.get("/api/news/latest", response_model=List[NewsItem], tags=["News"])
+def get_latest_market_news():
+    return fetch_all(Q.Q_LATEST_MARKET_NEWS)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8888, reload=True)
